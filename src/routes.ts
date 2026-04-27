@@ -4,12 +4,14 @@ export type Route = {
 };
 
 export const ROUTES: Readonly<Record<string, Route>> = {
-  // #claude-chat (kupatikana repos)
+  // #kt-claude-chat (kupatikana repos)
   C0AVD7BH4PL: { cwd: "/Users/rozzum/git/kupatikana", label: "kupatikana" },
 
-  // Add more channels here as you create them:
-  // "C…": { cwd: "/Users/rozzum/git/my-pensieve",        label: "my-pensieve" },
-  // "C…": { cwd: "/Users/rozzum/git/onepointtwocapital", label: "onepointtwocapital" },
+  // #mp-claude-chat (my-pensieve repos)
+  C0B0CBB0MJ5: { cwd: "/Users/rozzum/git/my-pensieve", label: "my-pensieve" },
+
+  // #opt-claude-chat (onepointtwocapital repos)
+  C0B0TNAEXFA: { cwd: "/Users/rozzum/git/onepointtwocapital", label: "onepointtwocapital" },
 };
 
 export const ALLOWED_USERS: ReadonlySet<string> = new Set([
