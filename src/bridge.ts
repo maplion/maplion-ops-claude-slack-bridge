@@ -229,6 +229,16 @@ function createSession(args: {
       // Disable it; the system prompt tells Claude to ask via plain text instead.
       disallowedTools: ["AskUserQuestion"],
       systemPrompt: buildSystemPrompt(route, channel, threadTs),
+      mcpServers: {
+        // Same docker mcp gateway the user installed for in-CLI use. Gives
+        // Claude tools: slack_post_message, slack_reply_to_thread,
+        // slack_add_reaction, slack_get_channel_history, etc.
+        slack: {
+          type: "stdio",
+          command: "docker",
+          args: ["mcp", "gateway", "run", "--server", "slack"],
+        },
+      },
       ...(resumeFrom ? { resume: resumeFrom } : {}),
     },
   });
@@ -381,6 +391,17 @@ function buildSystemPrompt(route: Route, channel: string, threadTs: string): str
     `LONG-RUNNING WORK`,
     `For multi-step tasks (e.g., GSD workflows), post brief progress updates as you complete steps so the user can follow along. Don't go silent for minutes at a time.`,
     `If a step fails, surface the error in the thread — don't just log it.`,
+    ``,
+    `SLACK TOOLS (mcp__slack__*)`,
+    `You have access to the Slack MCP server. Use sparingly — your text responses are AUTO-POSTED to this thread already, so you do NOT need slack_post_message or slack_reply_to_thread for ordinary replies.`,
+    `Good uses:`,
+    `- slack_add_reaction on the user's most recent message with :eyes: when you start, :white_check_mark: when you finish a long task, :x: if something failed.`,
+    `- slack_reply_to_thread for *additional* mid-task posts (channel_id=${channel}, thread_ts=${threadTs}) when you need to break a long output into chunks or post a code dump separately from explanation.`,
+    `- slack_get_channel_history if you need to look up something said earlier in the channel beyond your current thread.`,
+    `Bad uses:`,
+    `- Posting twice when one message would do.`,
+    `- Reacting to your own messages.`,
+    `- Posting via slack_post_message when you could just write the text and let it auto-post.`,
     ``,
     `SESSION CONTROL`,
     `The user can type !clear (also !reset, !end, !new) at any time to wipe context and start a fresh Claude session in this same thread. After GSD plan/execute phases complete, suggest the user run !clear before the next phase to keep context clean.`,
