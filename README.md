@@ -10,15 +10,31 @@ and replies in the thread.
 ## Architecture
 
 ```
-Slack workspace ──Socket Mode──► bridge process ──Claude Agent SDK──► Claude
-                                       │                                  │
-                                       └──reply via Bolt◄─────text────────┘
+Slack workspace ──Socket Mode──► bridge process
+                                       │
+                                       ▼
+                  ┌────────────────────────────────────────┐
+                  │  Map<thread_ts, ThreadSession>         │
+                  │                                        │
+                  │  thread T1: ┌──AsyncQueue──► Claude    │
+                  │             │                  │       │
+                  │             └──reply via Bolt◄─┘       │
+                  │                                        │
+                  │  thread T2: (independent session)      │
+                  └────────────────────────────────────────┘
 ```
 
 - **Single bot, single process** — one Slack app handles all GitHub orgs.
-- **Channel-based routing** — `src/routes.ts` maps `channel_id → { cwd, label }`.
+- **Channel-based routing** — [src/routes.ts](src/routes.ts) maps `channel_id → { cwd, label }`.
 - **User allowlist** — only `ALLOWED_USERS` from `routes.ts` can invoke.
-- **Stateless per turn** — each `@mention` re-fetches thread history and sends as prompt.
+- **Session per thread** — first `@mention` opens a persistent Claude Agent SDK
+  session whose `prompt` is an [AsyncQueue](src/async-queue.ts). Each thread
+  reply pushes into the queue → Claude continues mid-conversation. Idle for
+  30 min → session is reaped.
+- **`AskUserQuestion` is disabled** — Claude is told to ask in plain text. The
+  next thread reply is the answer. This is what lets interactive GSD workflows
+  (`gsd-discuss-phase`, `gsd-spec-phase`, `gsd-debug`, etc.) run end-to-end
+  from Slack.
 
 ## Prerequisites
 
@@ -105,12 +121,38 @@ PATH, so `node`/`npm` aren't on $PATH unless we source `.zshrc`. The wrapper at
 
 ## Usage
 
-In a routed channel (default: `#claude-chat`):
+Routed channels:
+- `#kt-claude-chat` → `~/git/kupatikana`
+- `#mp-claude-chat` → `~/git/my-pensieve`
+- `#opt-claude-chat` → `~/git/onepointtwocapital`
 
-> `@Claude Code MCP what's in package.json?`
+`@mention` to start, reply in the thread to continue:
 
-The bot replies in a thread. Continue the conversation by replying in the thread —
-the bridge re-sends the full thread as context each turn.
+> **You:**  `@Claude Code MCP what's in package.json?`
+> **Bot:**  *(replies in a new thread)*  The package.json shows a workspace…
+> **You:**  *(reply in same thread, no @mention needed)*  add a `lint` script too
+> **Bot:**  *(continues the same Claude session)*  Done — diff:
+
+The session stays alive across replies. Idle for 30 min → it closes and the
+next `@mention` starts fresh.
+
+### Running GSD (and other multi-turn skills) from Slack
+
+Because `AskUserQuestion` is disabled and the system prompt teaches Claude
+to ask in plain text:
+
+> **You:**  `@Claude Code MCP run /gsd-discuss-phase 5.3`
+> **Bot:**  *(works for a bit, then…)*  I have 3 gray areas to discuss.
+>          First: should the cache be in-memory or Redis-backed?
+>          A) in-memory  B) Redis  C) start in-memory, migrate later
+> **You:**  `B`
+> **Bot:**  Got it. Next: TTL strategy …
+
+Same flow works for `gsd-spec-phase`, `gsd-debug`, `gsd-plan-phase`, etc.
+
+⚠️ Long-running phase execution (`gsd-execute-phase`, `gsd-autonomous`) will
+run, but if anything errors mid-flight you may not see it until Claude
+finishes the turn. Watch logs with `tail -f`.
 
 ## Adding a new org / channel
 
@@ -131,6 +173,7 @@ the bridge re-sends the full thread as context each turn.
 | `SLACK_APP_TOKEN` | (required) | `xapp-…` with `connections:write` |
 | `ANTHROPIC_API_KEY` | optional | If unset, uses Claude subscription auth via `~/.claude/` |
 | `CLAUDE_MODEL` | `claude-sonnet-4-6` | Override to use Opus / Haiku |
+| `IDLE_TIMEOUT_MIN` | `30` | Minutes of inactivity before a thread session is reaped |
 
 ## Security notes
 
@@ -153,10 +196,17 @@ the bridge re-sends the full thread as context each turn.
 | `not_in_channel` error | Bot isn't a member — `/invite @Claude Code MCP` |
 | Connection drops repeatedly | Check `SLACK_APP_TOKEN` has `connections:write` scope |
 | `not_authed` / `invalid_auth` | Bot token rotated — update `.env` |
+| Bot replies once but ignores my thread follow-ups | First reply must come from the bot; if you replied to your own message before the bot did, no thread exists yet. Wait for the bot's first reply, then continue the thread. |
+| Session ended unexpectedly | Bridge restarted (e.g. launchd reload, crash). Live sessions are in-process state; restart loses them. Just `@mention` again. |
+| `:zzz: Session idle for 30 min — closing.` | Working as designed. `@mention` to start a new session. Set `IDLE_TIMEOUT_MIN` higher if 30 is too short. |
 
 ## Roadmap
 
-- [ ] Stream Claude's progress as edits to the placeholder (currently single update at end)
-- [ ] Persist `session_id` per `thread_ts` for cheaper continuations
-- [ ] Optional Slack MCP attach so Claude can post mid-thinking
-- [ ] Per-channel model override
+- [ ] Persist sessions across bridge restarts (resume by `session_id`)
+- [ ] Attach the Slack MCP server inside the session so Claude can post
+      progress reactions and intermediate messages mid-tool-use
+- [ ] Per-channel model override (heavyweight Opus on `#kt-claude-chat`,
+      Haiku on a high-frequency channel)
+- [ ] `interrupt` command — type `^stop` in a thread to abort a long task
+- [ ] Tool-call structured logging (timestamps, tool name, brief args/results)
+      for `tail -f` debugging
