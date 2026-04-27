@@ -4,6 +4,7 @@ import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-age
 import dotenv from "dotenv";
 import { ROUTES, ALLOWED_USERS, getRoute, type Route } from "./routes.js";
 import { AsyncQueue } from "./async-queue.js";
+import { SessionStore, type ThreadRef } from "./session-store.js";
 
 dotenv.config();
 
@@ -13,6 +14,8 @@ const SLACK_APP_TOKEN = required("SLACK_APP_TOKEN");
 // falls back to OAuth credentials in ~/.claude/ (your Pro/Max subscription).
 const MODEL = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6";
 const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MIN ?? 30) * 60 * 1000;
+
+const RESET_RE = /^\s*!(clear|reset|end|new)\b/i;
 
 const app = new App({
   token: SLACK_BOT_TOKEN,
@@ -31,6 +34,7 @@ type ThreadSession = {
 };
 
 const sessions = new Map<string, ThreadSession>();
+const store = new SessionStore();
 let BOT_USER_ID = "";
 let BOT_MENTION_RE: RegExp | null = null;
 
@@ -47,6 +51,7 @@ app.event("app_mention", async ({ event, client }) => {
   }
   const threadTs = event.thread_ts ?? event.ts;
   const text = stripMentions(event.text);
+  if (await maybeHandleResetCommand({ client, channel: event.channel, threadTs, text })) return;
   await sendToSession({
     client,
     channel: event.channel,
@@ -69,18 +74,59 @@ app.message(async ({ message, client }) => {
   // Skip if this is an @mention — it's already handled by app_mention
   if (BOT_MENTION_RE && BOT_MENTION_RE.test(message.text)) return;
 
-  const session = sessions.get(threadTs);
-  if (!session) return; // not a thread we manage
+  // For replies in threads, route can come from in-memory session OR from store
+  const liveSession = sessions.get(threadTs);
+  const ref = liveSession ? null : store.get(threadTs);
+  let route: Route | null = null;
+  let channel: string;
+  if (liveSession) {
+    route = liveSession.route;
+    channel = liveSession.channel;
+  } else if (ref) {
+    // Resume from store: validate the route still exists and the cwd matches
+    const r = getRoute(ref.channel);
+    if (!r || r.cwd !== ref.cwd) {
+      console.warn(`[bridge] stale ref thread=${threadTs} — channel route changed; ignoring`);
+      return;
+    }
+    route = r;
+    channel = ref.channel;
+  } else {
+    return; // not a thread we manage
+  }
 
   const text = stripMentions(message.text);
-  await sendToSession({
-    client,
-    channel: session.channel,
-    threadTs,
-    route: session.route,
-    text,
-  });
+  if (await maybeHandleResetCommand({ client, channel, threadTs, text })) return;
+  await sendToSession({ client, channel, threadTs, route, text });
 });
+
+async function maybeHandleResetCommand(args: {
+  client: WebClient;
+  channel: string;
+  threadTs: string;
+  text: string;
+}): Promise<boolean> {
+  const { client, channel, threadTs, text } = args;
+  if (!RESET_RE.test(text)) return false;
+
+  const live = sessions.get(threadTs);
+  if (live) {
+    live.inputQueue.close();
+    void live.query.interrupt().catch(() => {});
+    sessions.delete(threadTs);
+  }
+  store.delete(threadTs);
+
+  await client.chat
+    .postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: `:broom: _Session cleared. Your next message starts a fresh Claude context._`,
+    })
+    .catch(() => {});
+  console.log(`[bridge] reset thread=${threadTs}`);
+  return true;
+}
 
 async function sendToSession(args: {
   client: WebClient;
@@ -93,26 +139,36 @@ async function sendToSession(args: {
   if (!text.trim()) return;
 
   let session = sessions.get(threadTs);
-  if (!session) session = createSession({ client, channel, threadTs, route });
+  if (!session) {
+    const ref = store.get(threadTs);
+    const resumeFrom = ref?.sessionId ?? null;
+    session = createSession({ client, channel, threadTs, route, resumeFrom });
+  }
   session.lastActivity = Date.now();
+  // Mirror lastActivity to the store so idle accounting survives a restart
+  const ref = store.get(threadTs);
+  if (ref) {
+    ref.lastActivity = session.lastActivity;
+    ref.status = "active";
+    store.upsert(ref);
+  }
   try {
-    session.inputQueue.push({
-      type: "user",
-      message: { role: "user", content: text },
-      parent_tool_use_id: null,
-      session_id: "",
-    });
+    session.inputQueue.push(makeUserMessage(text));
   } catch {
     // Session was closing; start a fresh one and retry once.
     sessions.delete(threadTs);
-    session = createSession({ client, channel, threadTs, route });
-    session.inputQueue.push({
-      type: "user",
-      message: { role: "user", content: text },
-      parent_tool_use_id: null,
-      session_id: "",
-    });
+    session = createSession({ client, channel, threadTs, route, resumeFrom: null });
+    session.inputQueue.push(makeUserMessage(text));
   }
+}
+
+function makeUserMessage(text: string): SDKUserMessage {
+  return {
+    type: "user",
+    message: { role: "user", content: text },
+    parent_tool_use_id: null,
+    session_id: "",
+  };
 }
 
 function createSession(args: {
@@ -120,8 +176,9 @@ function createSession(args: {
   channel: string;
   threadTs: string;
   route: Route;
+  resumeFrom: string | null;
 }): ThreadSession {
-  const { client, channel, threadTs, route } = args;
+  const { client, channel, threadTs, route, resumeFrom } = args;
   const inputQueue = new AsyncQueue<SDKUserMessage>();
   const q = query({
     prompt: inputQueue,
@@ -133,6 +190,7 @@ function createSession(args: {
       // Disable it; the system prompt tells Claude to ask via plain text instead.
       disallowedTools: ["AskUserQuestion"],
       systemPrompt: buildSystemPrompt(route, channel, threadTs),
+      ...(resumeFrom ? { resume: resumeFrom } : {}),
     },
   });
   const session: ThreadSession = {
@@ -141,11 +199,30 @@ function createSession(args: {
     route,
     inputQueue,
     query: q,
-    pumpPromise: pumpOutputs(threadTs, q, client, channel),
+    pumpPromise: pumpOutputs(threadTs, q, client, channel, resumeFrom !== null),
     lastActivity: Date.now(),
   };
   sessions.set(threadTs, session);
-  console.log(`[bridge] session start thread=${threadTs} cwd=${route.cwd}`);
+
+  // Upsert the ref now (sessionId still null until first SDK message); ensures
+  // we don't lose the thread if the bridge dies before the first message lands.
+  const existing = store.get(threadTs);
+  const ref: ThreadRef = existing ?? {
+    threadTs,
+    channel,
+    cwd: route.cwd,
+    sessionId: null,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    status: "active",
+  };
+  ref.status = "active";
+  ref.lastActivity = Date.now();
+  store.upsert(ref);
+
+  console.log(
+    `[bridge] session ${resumeFrom ? "resumed" : "start"} thread=${threadTs} cwd=${route.cwd}${resumeFrom ? ` from=${resumeFrom}` : ""}`,
+  );
   return session;
 }
 
@@ -154,9 +231,26 @@ async function pumpOutputs(
   q: Query,
   client: WebClient,
   channel: string,
+  isResume: boolean,
 ): Promise<void> {
+  let sessionIdCaptured = false;
   try {
     for await (const msg of q) {
+      // Capture session_id from the first message that has one
+      if (!sessionIdCaptured) {
+        const sid = (msg as { session_id?: string }).session_id;
+        if (sid) {
+          sessionIdCaptured = true;
+          const ref = store.get(threadTs);
+          if (ref && ref.sessionId !== sid) {
+            ref.sessionId = sid;
+            ref.lastActivity = Date.now();
+            store.upsert(ref);
+            console.log(`[bridge] session_id captured thread=${threadTs} sid=${sid}`);
+          }
+        }
+      }
+
       if (msg.type === "assistant") {
         const text = (msg.message.content as Array<{ type: string; text?: string }>)
           .filter((b) => b.type === "text" && typeof b.text === "string")
@@ -179,6 +273,12 @@ async function pumpOutputs(
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[bridge] pump error thread=${threadTs}`, err);
+    // If a resume failed because the underlying session is gone, drop the ref so
+    // the next message starts fresh instead of looping on the same broken resume.
+    if (isResume && /session.*(not found|missing|invalid)/i.test(errMsg)) {
+      console.warn(`[bridge] resume failed, clearing ref thread=${threadTs}`);
+      store.delete(threadTs);
+    }
     await client.chat
       .postMessage({
         channel,
@@ -188,7 +288,12 @@ async function pumpOutputs(
       .catch(() => {});
   } finally {
     sessions.delete(threadTs);
-    console.log(`[bridge] session end thread=${threadTs}`);
+    const ref = store.get(threadTs);
+    if (ref) {
+      ref.status = "idle";
+      store.upsert(ref);
+    }
+    console.log(`[bridge] session unloaded thread=${threadTs}`);
   }
 }
 
@@ -213,6 +318,9 @@ function buildSystemPrompt(route: Route, channel: string, threadTs: string): str
     `LONG-RUNNING WORK`,
     `For multi-step tasks (e.g., GSD workflows), post brief progress updates as you complete steps so the user can follow along. Don't go silent for minutes at a time.`,
     `If a step fails, surface the error in the thread — don't just log it.`,
+    ``,
+    `SESSION CONTROL`,
+    `The user can type !clear (also !reset, !end, !new) at any time to wipe context and start a fresh Claude session in this same thread. After GSD plan/execute phases complete, suggest the user run !clear before the next phase to keep context clean.`,
   ].join("\n");
 }
 
@@ -234,31 +342,46 @@ function sweepIdleSessions(client: WebClient): void {
   const now = Date.now();
   for (const [threadTs, session] of sessions.entries()) {
     if (now - session.lastActivity < IDLE_TIMEOUT_MS) continue;
-    console.log(`[bridge] idle timeout thread=${threadTs}`);
+    console.log(`[bridge] idle pause thread=${threadTs}`);
     session.inputQueue.close();
     void session.query.interrupt().catch(() => {});
+    // Mark idle in the store (mapping kept for resume on next reply)
+    const ref = store.get(threadTs);
+    if (ref) {
+      ref.status = "idle";
+      store.upsert(ref);
+    }
     void client.chat
       .postMessage({
         channel: session.channel,
         thread_ts: threadTs,
-        text: `:zzz: _Session idle for ${IDLE_TIMEOUT_MS / 60000} min — closing. @mention me again to start a fresh one._`,
+        text: `:zzz: _Session paused after ${IDLE_TIMEOUT_MS / 60000} min idle — your next reply will resume it._`,
       })
       .catch(() => {});
   }
 }
 
 async function shutdown(reason: string): Promise<void> {
-  console.log(`[bridge] shutdown (${reason}); closing ${sessions.size} session(s)`);
-  for (const session of sessions.values()) {
+  console.log(`[bridge] shutdown (${reason}); closing ${sessions.size} live session(s)`);
+  for (const [threadTs, session] of sessions.entries()) {
     session.inputQueue.close();
     void session.query.interrupt().catch(() => {});
+    const ref = store.get(threadTs);
+    if (ref) {
+      ref.status = "idle";
+      store.upsert(ref);
+    }
   }
   // Give pumps a moment to drain
   await new Promise((r) => setTimeout(r, 500));
+  await store.flush().catch((e) => console.error("[bridge] store flush failed:", e));
+  await store.releaseLock();
   process.exit(0);
 }
 
 async function main(): Promise<void> {
+  await store.init();
+
   const auth = await app.client.auth.test();
   BOT_USER_ID = auth.user_id ?? "";
   if (!BOT_USER_ID) throw new Error("Could not resolve bot user ID from auth.test()");
@@ -266,7 +389,7 @@ async function main(): Promise<void> {
 
   await app.start();
   console.log(
-    `[bridge] running. model=${MODEL}, bot=${BOT_USER_ID}, idle_timeout=${IDLE_TIMEOUT_MS / 60000}min, channels=[${Object.keys(ROUTES).join(", ")}]`,
+    `[bridge] running. model=${MODEL}, bot=${BOT_USER_ID}, idle_timeout=${IDLE_TIMEOUT_MS / 60000}min, channels=[${Object.keys(ROUTES).join(", ")}], persisted_threads=${store.size()}`,
   );
 
   // Idle sweep every minute
