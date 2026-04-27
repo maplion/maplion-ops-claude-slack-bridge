@@ -23,10 +23,31 @@ Slack workspace ──Socket Mode──► bridge process ──Claude Agent SDK
 ## Prerequisites
 
 - Node.js ≥ 20
-- Anthropic API key
+- Either:
+  - **A Claude Pro/Max subscription** (the default — no API key needed; uses
+    OAuth tokens at `~/.claude/` from `claude login`), **or**
+  - **An Anthropic API key** (set `ANTHROPIC_API_KEY` for pay-as-you-go billing)
 - A Slack app with the manifest in this repo's wiki/docs (Socket Mode on,
   `app_mention` + `message.im` events, scopes for `chat:write`, `channels:history`,
   `groups:history`, etc.)
+
+### Auth: subscription vs API key
+
+The bridge spawns the Claude Code CLI as a subprocess. That CLI reads
+`ANTHROPIC_API_KEY` first; if unset, it falls back to OAuth credentials in
+`~/.claude/.credentials.json` (created when you ran `claude login`).
+
+| Mode | Cost | Caveats |
+|---|---|---|
+| **Subscription (no env var)** | Counts against your Pro/Max quota | Heavy bridge usage can exhaust your 5-hour windows, blocking interactive Claude Code use. Anthropic may rate-limit automated/agent-style use of subscription auth. |
+| **API key (`ANTHROPIC_API_KEY` set)** | Per-token API billing | Independent of your subscription. Better for high-volume or long-running agents. |
+
+To switch modes: set or unset `ANTHROPIC_API_KEY` in `.env` and restart the bridge.
+
+> ⚠️ If `ANTHROPIC_API_KEY` is exported in `~/.zshrc`, the launchd wrapper will
+> pick it up even if `.env` doesn't set it. To force subscription mode, either
+> remove it from `~/.zshrc` or add `unset ANTHROPIC_API_KEY` to
+> `scripts/launchd-run.sh` after the source line.
 
 ## Setup
 
@@ -108,7 +129,7 @@ the bridge re-sends the full thread as context each turn.
 |---|---|---|
 | `SLACK_BOT_TOKEN` | (required) | `xoxb-…` from OAuth & Permissions |
 | `SLACK_APP_TOKEN` | (required) | `xapp-…` with `connections:write` |
-| `ANTHROPIC_API_KEY` | (required) | Used by the Claude Agent SDK |
+| `ANTHROPIC_API_KEY` | optional | If unset, uses Claude subscription auth via `~/.claude/` |
 | `CLAUDE_MODEL` | `claude-sonnet-4-6` | Override to use Opus / Haiku |
 
 ## Security notes

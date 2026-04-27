@@ -7,7 +7,8 @@ dotenv.config();
 
 const SLACK_BOT_TOKEN = required("SLACK_BOT_TOKEN");
 const SLACK_APP_TOKEN = required("SLACK_APP_TOKEN");
-required("ANTHROPIC_API_KEY");
+// ANTHROPIC_API_KEY is optional. When unset, the underlying Claude Code CLI
+// falls back to OAuth credentials in ~/.claude/ (your Pro/Max subscription).
 const MODEL = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6";
 
 const app = new App({
