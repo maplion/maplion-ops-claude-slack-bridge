@@ -92,14 +92,27 @@ async function sendToSession(args: {
   const { client, channel, threadTs, route, text } = args;
   if (!text.trim()) return;
 
-  const session = sessions.get(threadTs) ?? createSession({ client, channel, threadTs, route });
+  let session = sessions.get(threadTs);
+  if (!session) session = createSession({ client, channel, threadTs, route });
   session.lastActivity = Date.now();
-  session.inputQueue.push({
-    type: "user",
-    message: { role: "user", content: text },
-    parent_tool_use_id: null,
-    session_id: "",
-  });
+  try {
+    session.inputQueue.push({
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+      session_id: "",
+    });
+  } catch {
+    // Session was closing; start a fresh one and retry once.
+    sessions.delete(threadTs);
+    session = createSession({ client, channel, threadTs, route });
+    session.inputQueue.push({
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+      session_id: "",
+    });
+  }
 }
 
 function createSession(args: {
@@ -217,6 +230,34 @@ function required(name: string): string {
   return v;
 }
 
+function sweepIdleSessions(client: WebClient): void {
+  const now = Date.now();
+  for (const [threadTs, session] of sessions.entries()) {
+    if (now - session.lastActivity < IDLE_TIMEOUT_MS) continue;
+    console.log(`[bridge] idle timeout thread=${threadTs}`);
+    session.inputQueue.close();
+    void session.query.interrupt().catch(() => {});
+    void client.chat
+      .postMessage({
+        channel: session.channel,
+        thread_ts: threadTs,
+        text: `:zzz: _Session idle for ${IDLE_TIMEOUT_MS / 60000} min — closing. @mention me again to start a fresh one._`,
+      })
+      .catch(() => {});
+  }
+}
+
+async function shutdown(reason: string): Promise<void> {
+  console.log(`[bridge] shutdown (${reason}); closing ${sessions.size} session(s)`);
+  for (const session of sessions.values()) {
+    session.inputQueue.close();
+    void session.query.interrupt().catch(() => {});
+  }
+  // Give pumps a moment to drain
+  await new Promise((r) => setTimeout(r, 500));
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
   const auth = await app.client.auth.test();
   BOT_USER_ID = auth.user_id ?? "";
@@ -227,6 +268,13 @@ async function main(): Promise<void> {
   console.log(
     `[bridge] running. model=${MODEL}, bot=${BOT_USER_ID}, idle_timeout=${IDLE_TIMEOUT_MS / 60000}min, channels=[${Object.keys(ROUTES).join(", ")}]`,
   );
+
+  // Idle sweep every minute
+  const sweepTimer = setInterval(() => sweepIdleSessions(app.client), 60_000);
+  sweepTimer.unref();
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {
