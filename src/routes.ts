@@ -4,7 +4,7 @@ export type Route = {
 };
 
 export const ROUTES: Readonly<Record<string, Route>> = {
-  // kt-claude-chat (kupatikana)
+  // #claude-chat (kupatikana repos)
   C0AVD7BH4PL: { cwd: "/Users/rozzum/git/kupatikana", label: "kupatikana" },
 
   // Add more channels here as you create them:

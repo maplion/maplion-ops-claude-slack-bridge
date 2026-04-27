@@ -47,9 +47,44 @@ npm run start    # one-shot
 
 Logs `[bridge] running. model=…, channels=[…]` when ready.
 
+## Run as a service (macOS / launchd)
+
+For "always on, restart on crash, start at login":
+
+```bash
+./scripts/install-launchd.sh
+```
+
+This:
+- copies [launchd/com.maplion.claude-slack-bridge.plist](launchd/com.maplion.claude-slack-bridge.plist) to `~/Library/LaunchAgents/`
+- creates `~/Library/Logs/maplion-ops-claude-slack-bridge/{out,err}.log`
+- bootstraps the agent into the GUI domain so it runs as your login user
+- starts it immediately
+
+**Manage it:**
+
+```bash
+# tail logs
+tail -f ~/Library/Logs/maplion-ops-claude-slack-bridge/out.log \
+        ~/Library/Logs/maplion-ops-claude-slack-bridge/err.log
+
+# restart (e.g. after editing routes.ts)
+launchctl kickstart -k gui/$(id -u)/com.maplion.claude-slack-bridge
+
+# stop without uninstalling
+launchctl disable gui/$(id -u)/com.maplion.claude-slack-bridge
+
+# remove entirely
+./scripts/uninstall-launchd.sh
+```
+
+**Why a wrapper script?** launchd processes don't inherit your interactive shell's
+PATH, so `node`/`npm` aren't on $PATH unless we source `.zshrc`. The wrapper at
+[scripts/launchd-run.sh](scripts/launchd-run.sh) handles that.
+
 ## Usage
 
-In a routed channel (default: `#kt-claude-chat`):
+In a routed channel (default: `#claude-chat`):
 
 > `@Claude Code MCP what's in package.json?`
 
@@ -104,4 +139,3 @@ the bridge re-sends the full thread as context each turn.
 - [ ] Persist `session_id` per `thread_ts` for cheaper continuations
 - [ ] Optional Slack MCP attach so Claude can post mid-thinking
 - [ ] Per-channel model override
-- [ ] systemd / launchd wrapper for "always-on"
