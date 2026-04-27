@@ -16,6 +16,7 @@ const MODEL = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6";
 const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MIN ?? 30) * 60 * 1000;
 
 const RESET_RE = /^\s*!(clear|reset|end|new)\b/i;
+const STOP_RE = /^\s*!stop\b/i;
 
 const app = new App({
   token: SLACK_BOT_TOKEN,
@@ -52,6 +53,7 @@ app.event("app_mention", async ({ event, client }) => {
   const threadTs = event.thread_ts ?? event.ts;
   const text = stripMentions(event.text);
   if (await maybeHandleResetCommand({ client, channel: event.channel, threadTs, text })) return;
+  if (await maybeHandleStopCommand({ client, channel: event.channel, threadTs, text })) return;
   await sendToSession({
     client,
     channel: event.channel,
@@ -97,6 +99,7 @@ app.message(async ({ message, client }) => {
 
   const text = stripMentions(message.text);
   if (await maybeHandleResetCommand({ client, channel, threadTs, text })) return;
+  if (await maybeHandleStopCommand({ client, channel, threadTs, text })) return;
   await sendToSession({ client, channel, threadTs, route, text });
 });
 
@@ -125,6 +128,41 @@ async function maybeHandleResetCommand(args: {
     })
     .catch(() => {});
   console.log(`[bridge] reset thread=${threadTs}`);
+  return true;
+}
+
+async function maybeHandleStopCommand(args: {
+  client: WebClient;
+  channel: string;
+  threadTs: string;
+  text: string;
+}): Promise<boolean> {
+  const { client, channel, threadTs, text } = args;
+  if (!STOP_RE.test(text)) return false;
+
+  const live = sessions.get(threadTs);
+  if (!live) {
+    await client.chat
+      .postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `:information_source: _No active task to stop. Send a new message to continue._`,
+      })
+      .catch(() => {});
+    return true;
+  }
+
+  await live.query
+    .interrupt()
+    .catch((err) => console.error(`[bridge] interrupt failed thread=${threadTs}`, err));
+  await client.chat
+    .postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: `:octagonal_sign: _Stopped current task. Session preserved — send your next message to continue._`,
+    })
+    .catch(() => {});
+  console.log(`[bridge] stop thread=${threadTs}`);
   return true;
 }
 
@@ -321,6 +359,7 @@ function buildSystemPrompt(route: Route, channel: string, threadTs: string): str
     ``,
     `SESSION CONTROL`,
     `The user can type !clear (also !reset, !end, !new) at any time to wipe context and start a fresh Claude session in this same thread. After GSD plan/execute phases complete, suggest the user run !clear before the next phase to keep context clean.`,
+    `The user can type !stop to abort your current turn without clearing the session. After !stop, your next user message resumes the conversation with full context intact. If a long task is going off-track, suggest the user type !stop and try again with adjusted instructions.`,
   ].join("\n");
 }
 
