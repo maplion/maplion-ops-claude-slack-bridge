@@ -1,0 +1,27 @@
+{
+  "name": "maplion-ops-claude-slack-bridge",
+  "version": "0.1.0",
+  "description": "Slack -> local Claude Code bridge. @mention or DM the bot; it spawns a Claude Agent SDK session with cwd routed by channel.",
+  "private": true,
+  "type": "module",
+  "main": "dist/bridge.js",
+  "scripts": {
+    "dev": "tsx watch src/bridge.ts",
+    "start": "tsx src/bridge.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0",
+    "@slack/bolt": "^4.0.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
