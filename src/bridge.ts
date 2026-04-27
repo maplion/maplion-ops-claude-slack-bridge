@@ -116,6 +116,9 @@ function createSession(args: {
       cwd: route.cwd,
       permissionMode: "bypassPermissions",
       model: MODEL,
+      // AskUserQuestion would block forever — the SDK has no path to a human.
+      // Disable it; the system prompt tells Claude to ask via plain text instead.
+      disallowedTools: ["AskUserQuestion"],
       systemPrompt: buildSystemPrompt(route, channel, threadTs),
     },
   });
@@ -182,12 +185,21 @@ function buildSystemPrompt(route: Route, channel: string, threadTs: string): str
     `Working directory: ${route.cwd} (${route.label}).`,
     `Channel ID: ${channel}. Thread TS: ${threadTs}.`,
     ``,
-    `Each text response you produce will be posted as a separate message in this Slack thread.`,
-    `Use Slack mrkdwn formatting: *bold*, _italic_, \`code\`, \`\`\`code blocks\`\`\`, > quotes, line breaks.`,
-    `Do NOT use markdown headers (# ##), tables, or task lists — they don't render in Slack.`,
-    `Keep replies concise. The user is reading on a phone or laptop, not a terminal.`,
+    `OUTPUT FORMAT`,
+    `Each text response you produce becomes a separate Slack message in this thread.`,
+    `Use Slack mrkdwn: *bold*, _italic_, \`code\`, \`\`\`code blocks\`\`\`, > quotes, line breaks.`,
+    `Do NOT use markdown headers (# ##), tables, or task lists — Slack does not render them.`,
+    `Keep replies concise. The user is on Slack, not a terminal.`,
     ``,
-    `When you need to ask the user a question, just write it in plain text. Their next thread reply becomes your next user message — the session stays alive until idle.`,
+    `ASKING QUESTIONS`,
+    `The AskUserQuestion tool is DISABLED in this environment.`,
+    `When you need to ask the user something — including when a skill or agent instructs you to use AskUserQuestion — write the question in plain text instead. End your message with the question.`,
+    `Your session stays alive: the user's next thread reply becomes your next user message. You can multi-turn freely.`,
+    `If a skill expects multi-choice answers, list options inline like \`A) foo  B) bar  C) baz\` and ask the user to reply with a letter.`,
+    ``,
+    `LONG-RUNNING WORK`,
+    `For multi-step tasks (e.g., GSD workflows), post brief progress updates as you complete steps so the user can follow along. Don't go silent for minutes at a time.`,
+    `If a step fails, surface the error in the thread — don't just log it.`,
   ].join("\n");
 }
 
