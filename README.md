@@ -36,10 +36,14 @@ Slack workspace ──Socket Mode──► bridge process
   full conversation history from `~/.claude/projects/`.
 - **Idle = pause, not end** — after 30 min of silence the in-memory session
   is interrupted but the store entry is kept. Next reply resumes seamlessly.
-- **`AskUserQuestion` is disabled** — Claude is told to ask in plain text. The
-  next thread reply is the answer. This is what lets interactive GSD workflows
-  (`gsd-discuss-phase`, `gsd-spec-phase`, `gsd-debug`, etc.) run end-to-end
-  from Slack.
+- **`AskUserQuestion` proxied** — the built-in tool stays disabled (would block
+  forever in the SDK), but Claude is given an in-process MCP tool
+  `mcp__slack-ux__slack_ask` that posts formatted questions to the Slack
+  thread, pauses the turn, and resolves with the user's reply. This is what
+  lets interactive GSD workflows (`gsd-discuss-phase`, `gsd-spec-phase`,
+  `gsd-debug`, etc.) run end-to-end from Slack.
+- **Slack MCP attached** — Claude can react with emoji, post mid-task progress,
+  read channel history. Same docker-mcp gateway used by the in-CLI bridge.
 
 ## Prerequisites
 
@@ -166,6 +170,10 @@ Type these as a regular thread message (no `@mention` needed):
 | Command | Effect |
 |---|---|
 | `!clear` (also `!reset`, `!end`, `!new`) | Interrupts the live session, deletes the thread's store entry, and starts fresh on your next message. Use between GSD plan/execute phases per the GSD `/clear` discipline. |
+| `!stop` | Cancels Claude's current turn (incl. running tool calls) but keeps the session and conversation history. Your next message continues where the conversation left off. Use when a long task is going off-track. |
+
+Both also reject any pending `slack_ask` so Claude's tool call returns
+an error result and the model can adapt.
 
 Example GSD multi-phase flow:
 
@@ -196,6 +204,7 @@ Example GSD multi-phase flow:
 | `ANTHROPIC_API_KEY` | optional | If unset, uses Claude subscription auth via `~/.claude/` |
 | `CLAUDE_MODEL` | `claude-sonnet-4-6` | Override to use Opus / Haiku |
 | `IDLE_TIMEOUT_MIN` | `30` | Minutes of inactivity before a thread session is reaped |
+| `BRIDGE_LOG_LEVEL` | `info` | `info` logs tool calls + results; `debug` adds 240-char result previews |
 
 ## Security notes
 
@@ -224,15 +233,37 @@ Example GSD multi-phase flow:
 | Resumed reply ignores prior context | The `~/.claude/projects/` history file may have been cleared. Run `!clear` and start fresh. |
 | `Session error: session not found` | The session_id in `threads.json` no longer exists in `~/.claude/projects/` (e.g., manually deleted). The bridge auto-clears the ref; just send your message again. |
 
+## Observability
+
+`tail -f ~/Library/Logs/maplion-ops-claude-slack-bridge/out.log` shows a
+live transcript of what Claude is doing in every thread:
+
+```
+14:32:01 [bridge] thread=1722... session start cwd=/Users/.../kupatikana
+14:32:01 [bridge] thread=1722... session_id sid=abc123…
+14:32:02 [bridge] thread=1722... tool Read(path=…/kt-mobile-ui/package.json)
+14:32:02 [bridge] thread=1722... result 1247c
+14:32:04 [bridge] thread=1722... tool Bash(cmd=git status -sb)
+14:32:05 [bridge] thread=1722... result 89c
+14:32:06 [bridge] thread=1722... tool mcp__slack-ux__slack_ask(question…)
+14:32:06 [bridge] thread=1722... slack_ask waiting q="Which DB backend?"
+14:33:11 [bridge] thread=1722... slack_ask resolved
+14:33:14 [bridge] thread=1722... turn done cost=$0.0042 turns=2 dur=3100ms
+```
+
+Set `BRIDGE_LOG_LEVEL=debug` for tool-result previews.
+
 ## Roadmap
 
 - [x] Persist sessions across bridge restarts (resume by `session_id`)
 - [x] User commands for session lifecycle (`!clear`, `!reset`, `!end`, `!new`)
-- [ ] Attach the Slack MCP server inside the session so Claude can post
-      progress reactions and intermediate messages mid-tool-use
+- [x] `!stop` — interrupt a running task without clearing the session
+- [x] Tool-call structured logging
+- [x] Slack MCP attached so Claude can post progress reactions / mid-flow messages
+- [x] `AskUserQuestion` proxied via `slack_ask` in-process MCP
 - [ ] Per-channel model override (heavyweight Opus on `#kt-claude-chat`,
       Haiku on a high-frequency channel)
-- [ ] `!stop` command — interrupt a running long task without clearing the session
-- [ ] Tool-call structured logging (timestamps, tool name, brief args/results)
-      for `tail -f` debugging
-- [ ] Real `AskUserQuestion` proxying (currently disabled with plain-text fallback)
+- [ ] Streaming output — chunk long replies as they're produced rather than
+      one big post per turn
+- [ ] Plan mode (`EnterPlanMode`/`ExitPlanMode`) verification
+- [ ] File/image upload from Slack into Claude (currently text-only)
