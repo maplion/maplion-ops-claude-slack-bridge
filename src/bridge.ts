@@ -1,7 +1,9 @@
 import { App } from "@slack/bolt";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { WebClient } from "@slack/web-api";
+import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import dotenv from "dotenv";
 import { ROUTES, ALLOWED_USERS, getRoute, type Route } from "./routes.js";
+import { AsyncQueue } from "./async-queue.js";
 
 dotenv.config();
 
@@ -10,12 +12,27 @@ const SLACK_APP_TOKEN = required("SLACK_APP_TOKEN");
 // ANTHROPIC_API_KEY is optional. When unset, the underlying Claude Code CLI
 // falls back to OAuth credentials in ~/.claude/ (your Pro/Max subscription).
 const MODEL = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6";
+const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MIN ?? 30) * 60 * 1000;
 
 const app = new App({
   token: SLACK_BOT_TOKEN,
   appToken: SLACK_APP_TOKEN,
   socketMode: true,
 });
+
+type ThreadSession = {
+  threadTs: string;
+  channel: string;
+  route: Route;
+  inputQueue: AsyncQueue<SDKUserMessage>;
+  query: Query;
+  pumpPromise: Promise<void>;
+  lastActivity: number;
+};
+
+const sessions = new Map<string, ThreadSession>();
+let BOT_USER_ID = "";
+let BOT_MENTION_RE: RegExp | null = null;
 
 app.event("app_mention", async ({ event, client }) => {
   const route = getRoute(event.channel);
@@ -28,92 +45,150 @@ app.event("app_mention", async ({ event, client }) => {
     });
     return;
   }
-  await runClaude({
+  const threadTs = event.thread_ts ?? event.ts;
+  const text = stripMentions(event.text);
+  await sendToSession({
     client,
     channel: event.channel,
-    threadTs: event.thread_ts ?? event.ts,
-    userId: event.user,
+    threadTs,
     route,
+    text,
   });
 });
 
 app.message(async ({ message, client }) => {
   if (message.subtype) return;
-  if (message.channel_type !== "im") return;
   if (!("user" in message) || !("text" in message)) return;
-  await client.chat.postMessage({
-    channel: message.channel,
-    text: "DMs aren't routed. @mention me in a routed channel (e.g. #kt-claude-chat).",
+  if (!message.user || !message.text) return;
+  if (message.user === BOT_USER_ID) return;
+  if (!ALLOWED_USERS.has(message.user)) return;
+
+  const threadTs = "thread_ts" in message ? message.thread_ts : undefined;
+  if (!threadTs) return; // only thread replies; first @mentions go through app_mention
+
+  // Skip if this is an @mention — it's already handled by app_mention
+  if (BOT_MENTION_RE && BOT_MENTION_RE.test(message.text)) return;
+
+  const session = sessions.get(threadTs);
+  if (!session) return; // not a thread we manage
+
+  const text = stripMentions(message.text);
+  await sendToSession({
+    client,
+    channel: session.channel,
+    threadTs,
+    route: session.route,
+    text,
   });
 });
 
-async function runClaude(args: {
-  client: App["client"];
+async function sendToSession(args: {
+  client: WebClient;
   channel: string;
   threadTs: string;
-  userId: string;
   route: Route;
+  text: string;
 }): Promise<void> {
-  const { client, channel, threadTs, userId, route } = args;
+  const { client, channel, threadTs, route, text } = args;
+  if (!text.trim()) return;
 
-  const placeholder = await client.chat.postMessage({
-    channel,
-    thread_ts: threadTs,
-    text: `:hourglass_flowing_sand: _Working in *${route.label}* (\`${route.cwd}\`)..._`,
+  const session = sessions.get(threadTs) ?? createSession({ client, channel, threadTs, route });
+  session.lastActivity = Date.now();
+  session.inputQueue.push({
+    type: "user",
+    message: { role: "user", content: text },
+    parent_tool_use_id: null,
+    session_id: "",
   });
-  const placeholderTs = placeholder.ts;
-  if (!placeholderTs) return;
+}
 
+function createSession(args: {
+  client: WebClient;
+  channel: string;
+  threadTs: string;
+  route: Route;
+}): ThreadSession {
+  const { client, channel, threadTs, route } = args;
+  const inputQueue = new AsyncQueue<SDKUserMessage>();
+  const q = query({
+    prompt: inputQueue,
+    options: {
+      cwd: route.cwd,
+      permissionMode: "bypassPermissions",
+      model: MODEL,
+      systemPrompt: buildSystemPrompt(route, channel, threadTs),
+    },
+  });
+  const session: ThreadSession = {
+    threadTs,
+    channel,
+    route,
+    inputQueue,
+    query: q,
+    pumpPromise: pumpOutputs(threadTs, q, client, channel),
+    lastActivity: Date.now(),
+  };
+  sessions.set(threadTs, session);
+  console.log(`[bridge] session start thread=${threadTs} cwd=${route.cwd}`);
+  return session;
+}
+
+async function pumpOutputs(
+  threadTs: string,
+  q: Query,
+  client: WebClient,
+  channel: string,
+): Promise<void> {
   try {
-    const replies = await client.conversations.replies({ channel, ts: threadTs, limit: 50 });
-    const prompt = buildPrompt(replies.messages ?? [], placeholderTs);
-    if (!prompt.trim()) {
-      await client.chat.update({ channel, ts: placeholderTs, text: "(empty prompt)" });
-      return;
-    }
-
-    let answer = "";
-    for await (const msg of query({
-      prompt,
-      options: {
-        cwd: route.cwd,
-        permissionMode: "bypassPermissions",
-        model: MODEL,
-        systemPrompt: [
-          `You are operating remotely via Slack on behalf of <@${userId}>.`,
-          `Working directory: ${route.cwd} (${route.label}).`,
-          `Keep replies concise. Use Slack mrkdwn (*bold*, \`code\`, line breaks) — not markdown headers or tables.`,
-        ].join("\n"),
-      },
-    })) {
+    for await (const msg of q) {
       if (msg.type === "assistant") {
-        for (const block of msg.message.content) {
-          if (block.type === "text") answer += block.text;
+        const text = (msg.message.content as Array<{ type: string; text?: string }>)
+          .filter((b) => b.type === "text" && typeof b.text === "string")
+          .map((b) => b.text!)
+          .join("");
+        if (text.trim()) {
+          await client.chat.postMessage({
+            channel,
+            thread_ts: threadTs,
+            text: truncate(text, 39000),
+          });
         }
+      } else if (msg.type === "result") {
+        const r = msg as { total_cost_usd?: number; num_turns?: number; duration_ms?: number };
+        console.log(
+          `[bridge] turn done thread=${threadTs} cost=$${r.total_cost_usd?.toFixed(4) ?? "?"} turns=${r.num_turns ?? "?"} dur=${r.duration_ms ?? "?"}ms`,
+        );
       }
     }
-
-    const final = answer.trim() || "_(no text response)_";
-    await client.chat.update({ channel, ts: placeholderTs, text: truncate(final, 39000) });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("[bridge] error", err);
-    await client.chat.update({
-      channel,
-      ts: placeholderTs,
-      text: `:x: Error: \`${msg.slice(0, 500)}\``,
-    });
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[bridge] pump error thread=${threadTs}`, err);
+    await client.chat
+      .postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: `:x: Session error: \`${errMsg.slice(0, 500)}\``,
+      })
+      .catch(() => {});
+  } finally {
+    sessions.delete(threadTs);
+    console.log(`[bridge] session end thread=${threadTs}`);
   }
 }
 
-function buildPrompt(
-  messages: ReadonlyArray<{ user?: string; text?: string; ts?: string }>,
-  excludeTs: string,
-): string {
-  return messages
-    .filter((m) => m.ts !== excludeTs && m.text)
-    .map((m) => `<@${m.user ?? "unknown"}>: ${stripMentions(m.text!)}`)
-    .join("\n");
+function buildSystemPrompt(route: Route, channel: string, threadTs: string): string {
+  return [
+    `You are Claude operating remotely via Slack.`,
+    `Working directory: ${route.cwd} (${route.label}).`,
+    `Channel ID: ${channel}. Thread TS: ${threadTs}.`,
+    ``,
+    `Each text response you produce will be posted as a separate message in this Slack thread.`,
+    `Use Slack mrkdwn formatting: *bold*, _italic_, \`code\`, \`\`\`code blocks\`\`\`, > quotes, line breaks.`,
+    `Do NOT use markdown headers (# ##), tables, or task lists — they don't render in Slack.`,
+    `Keep replies concise. The user is reading on a phone or laptop, not a terminal.`,
+    ``,
+    `When you need to ask the user a question, just write it in plain text. Their next thread reply becomes your next user message — the session stays alive until idle.`,
+  ].join("\n");
 }
 
 function stripMentions(text: string): string {
@@ -130,5 +205,19 @@ function required(name: string): string {
   return v;
 }
 
-await app.start();
-console.log(`[bridge] running. model=${MODEL}, channels=[${Object.keys(ROUTES).join(", ")}]`);
+async function main(): Promise<void> {
+  const auth = await app.client.auth.test();
+  BOT_USER_ID = auth.user_id ?? "";
+  if (!BOT_USER_ID) throw new Error("Could not resolve bot user ID from auth.test()");
+  BOT_MENTION_RE = new RegExp(`<@${BOT_USER_ID}>`);
+
+  await app.start();
+  console.log(
+    `[bridge] running. model=${MODEL}, bot=${BOT_USER_ID}, idle_timeout=${IDLE_TIMEOUT_MS / 60000}min, channels=[${Object.keys(ROUTES).join(", ")}]`,
+  );
+}
+
+main().catch((err) => {
+  console.error("[bridge] fatal", err);
+  process.exit(1);
+});
