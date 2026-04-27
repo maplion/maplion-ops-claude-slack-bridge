@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import { ROUTES, ALLOWED_USERS, getRoute, type Route } from "./routes.js";
 import { AsyncQueue } from "./async-queue.js";
 import { SessionStore, type ThreadRef } from "./session-store.js";
+import { buildSlackAskMcp, type AskResolver } from "./slack-ask-mcp.js";
 
 dotenv.config();
 
@@ -37,6 +38,7 @@ type ThreadSession = {
 
 const sessions = new Map<string, ThreadSession>();
 const store = new SessionStore();
+const pendingAsks = new Map<string, AskResolver>();
 let BOT_USER_ID = "";
 let BOT_MENTION_RE: RegExp | null = null;
 
@@ -113,6 +115,7 @@ async function maybeHandleResetCommand(args: {
   const { client, channel, threadTs, text } = args;
   if (!RESET_RE.test(text)) return false;
 
+  rejectPending(threadTs, "session cleared by user");
   const live = sessions.get(threadTs);
   if (live) {
     live.inputQueue.close();
@@ -153,6 +156,7 @@ async function maybeHandleStopCommand(args: {
     return true;
   }
 
+  rejectPending(threadTs, "stopped by user");
   await live.query
     .interrupt()
     .catch((err) => console.error(`[bridge] interrupt failed thread=${threadTs}`, err));
@@ -167,6 +171,14 @@ async function maybeHandleStopCommand(args: {
   return true;
 }
 
+function rejectPending(threadTs: string, reason: string): void {
+  const p = pendingAsks.get(threadTs);
+  if (p) {
+    pendingAsks.delete(threadTs);
+    p.reject(new Error(reason));
+  }
+}
+
 async function sendToSession(args: {
   client: WebClient;
   channel: string;
@@ -176,6 +188,24 @@ async function sendToSession(args: {
 }): Promise<void> {
   const { client, channel, threadTs, route, text } = args;
   if (!text.trim()) return;
+
+  // If Claude is awaiting a slack_ask answer in this thread, this reply IS
+  // the answer — resolve the tool's promise and don't push as a fresh user
+  // message (Claude is still mid-turn).
+  const pending = pendingAsks.get(threadTs);
+  if (pending) {
+    pendingAsks.delete(threadTs);
+    blog(threadTs, "info", `slack_ask resolved`);
+    pending.resolve(text);
+    const ref = store.get(threadTs);
+    if (ref) {
+      ref.lastActivity = Date.now();
+      store.upsert(ref);
+    }
+    const live = sessions.get(threadTs);
+    if (live) live.lastActivity = Date.now();
+    return;
+  }
 
   let session = sessions.get(threadTs);
   if (!session) {
@@ -238,6 +268,20 @@ function createSession(args: {
           command: "docker",
           args: ["mcp", "gateway", "run", "--server", "slack"],
         },
+        // In-process MCP server providing slack_ask — proxies Claude's
+        // questions to the user via the Slack thread and pauses until the
+        // user replies.
+        "slack-ux": buildSlackAskMcp({
+          threadTs,
+          channel,
+          client,
+          registerPending: (r) => {
+            const existing = pendingAsks.get(threadTs);
+            if (existing) existing.reject(new Error("superseded by new question"));
+            pendingAsks.set(threadTs, r);
+          },
+          log: (msg) => blog(threadTs, "info", msg),
+        }),
       },
       ...(resumeFrom ? { resume: resumeFrom } : {}),
     },
@@ -383,10 +427,11 @@ function buildSystemPrompt(route: Route, channel: string, threadTs: string): str
     `Keep replies concise. The user is on Slack, not a terminal.`,
     ``,
     `ASKING QUESTIONS`,
-    `The AskUserQuestion tool is DISABLED in this environment.`,
-    `When you need to ask the user something — including when a skill or agent instructs you to use AskUserQuestion — write the question in plain text instead. End your message with the question.`,
-    `Your session stays alive: the user's next thread reply becomes your next user message. You can multi-turn freely.`,
-    `If a skill expects multi-choice answers, list options inline like \`A) foo  B) bar  C) baz\` and ask the user to reply with a letter.`,
+    `The AskUserQuestion tool is DISABLED in this environment. Two ways to ask:`,
+    `1. Plain text — just write the question and the user's next reply becomes your next user message. Best for open-ended questions.`,
+    `2. mcp__slack-ux__slack_ask — pauses your turn, posts a formatted question to the thread (with optional multi-choice options), and returns the user's reply as the tool result. Best when a skill/agent wants structured input (the kind of thing AskUserQuestion would be used for).`,
+    `When a skill instructs you to "use AskUserQuestion", call slack_ask instead — it's the same semantics adapted for Slack.`,
+    `Your session stays alive across replies, so you can multi-turn freely either way.`,
     ``,
     `LONG-RUNNING WORK`,
     `For multi-step tasks (e.g., GSD workflows), post brief progress updates as you complete steps so the user can follow along. Don't go silent for minutes at a time.`,
@@ -456,7 +501,8 @@ function sweepIdleSessions(client: WebClient): void {
   const now = Date.now();
   for (const [threadTs, session] of sessions.entries()) {
     if (now - session.lastActivity < IDLE_TIMEOUT_MS) continue;
-    console.log(`[bridge] idle pause thread=${threadTs}`);
+    blog(threadTs, "info", "idle pause");
+    rejectPending(threadTs, "idle timeout");
     session.inputQueue.close();
     void session.query.interrupt().catch(() => {});
     // Mark idle in the store (mapping kept for resume on next reply)
@@ -478,6 +524,7 @@ function sweepIdleSessions(client: WebClient): void {
 async function shutdown(reason: string): Promise<void> {
   console.log(`[bridge] shutdown (${reason}); closing ${sessions.size} live session(s)`);
   for (const [threadTs, session] of sessions.entries()) {
+    rejectPending(threadTs, "bridge shutting down");
     session.inputQueue.close();
     void session.query.interrupt().catch(() => {});
     const ref = store.get(threadTs);
