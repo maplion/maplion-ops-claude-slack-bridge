@@ -27,10 +27,15 @@ Slack workspace ──Socket Mode──► bridge process
 - **Single bot, single process** — one Slack app handles all GitHub orgs.
 - **Channel-based routing** — [src/routes.ts](src/routes.ts) maps `channel_id → { cwd, label }`.
 - **User allowlist** — only `ALLOWED_USERS` from `routes.ts` can invoke.
-- **Session per thread** — first `@mention` opens a persistent Claude Agent SDK
-  session whose `prompt` is an [AsyncQueue](src/async-queue.ts). Each thread
-  reply pushes into the queue → Claude continues mid-conversation. Idle for
-  30 min → session is reaped.
+- **Session per thread, persistent across restarts** — first `@mention`
+  opens a Claude Agent SDK session whose `prompt` is an
+  [AsyncQueue](src/async-queue.ts). The SDK's `session_id` is captured and
+  written to [~/Library/Application Support/maplion-ops-claude-slack-bridge/threads.json](src/session-store.ts).
+  On the next reply (after idle pause OR bridge restart), the bridge calls
+  `query({ options: { resume: sessionId } })` and the Claude Code CLI hydrates
+  full conversation history from `~/.claude/projects/`.
+- **Idle = pause, not end** — after 30 min of silence the in-memory session
+  is interrupted but the store entry is kept. Next reply resumes seamlessly.
 - **`AskUserQuestion` is disabled** — Claude is told to ask in plain text. The
   next thread reply is the answer. This is what lets interactive GSD workflows
   (`gsd-discuss-phase`, `gsd-spec-phase`, `gsd-debug`, etc.) run end-to-end
@@ -154,6 +159,23 @@ Same flow works for `gsd-spec-phase`, `gsd-debug`, `gsd-plan-phase`, etc.
 run, but if anything errors mid-flight you may not see it until Claude
 finishes the turn. Watch logs with `tail -f`.
 
+### Session control commands
+
+Type these as a regular thread message (no `@mention` needed):
+
+| Command | Effect |
+|---|---|
+| `!clear` (also `!reset`, `!end`, `!new`) | Interrupts the live session, deletes the thread's store entry, and starts fresh on your next message. Use between GSD plan/execute phases per the GSD `/clear` discipline. |
+
+Example GSD multi-phase flow:
+
+> **You:**  `@Claude Code MCP /gsd-plan-phase 5.3`
+> **Bot:**  *(plans phase, asks questions, finalizes plan)*
+> **You:**  `!clear`
+> **Bot:**  `:broom: Session cleared.`
+> **You:**  `@Claude Code MCP /gsd-execute-phase 5.3`
+> **Bot:**  *(executes with fresh context — no plan-phase clutter)*
+
 ## Adding a new org / channel
 
 1. Create a private channel in Slack (e.g. `#pensieve-claude`).
@@ -197,16 +219,20 @@ finishes the turn. Watch logs with `tail -f`.
 | Connection drops repeatedly | Check `SLACK_APP_TOKEN` has `connections:write` scope |
 | `not_authed` / `invalid_auth` | Bot token rotated — update `.env` |
 | Bot replies once but ignores my thread follow-ups | First reply must come from the bot; if you replied to your own message before the bot did, no thread exists yet. Wait for the bot's first reply, then continue the thread. |
-| Session ended unexpectedly | Bridge restarted (e.g. launchd reload, crash). Live sessions are in-process state; restart loses them. Just `@mention` again. |
-| `:zzz: Session idle for 30 min — closing.` | Working as designed. `@mention` to start a new session. Set `IDLE_TIMEOUT_MIN` higher if 30 is too short. |
+| `:zzz: Session paused…` | Idle timeout fired. Just reply — the next message resumes. Set `IDLE_TIMEOUT_MIN` higher if 30 min is too short. |
+| Bridge won't start: "Another bridge instance is running (pid=…)" | Stale lockfile or a real second instance. Check `ps -p <pid>`; if dead, remove `~/Library/Application Support/maplion-ops-claude-slack-bridge/bridge.lock`. |
+| Resumed reply ignores prior context | The `~/.claude/projects/` history file may have been cleared. Run `!clear` and start fresh. |
+| `Session error: session not found` | The session_id in `threads.json` no longer exists in `~/.claude/projects/` (e.g., manually deleted). The bridge auto-clears the ref; just send your message again. |
 
 ## Roadmap
 
-- [ ] Persist sessions across bridge restarts (resume by `session_id`)
+- [x] Persist sessions across bridge restarts (resume by `session_id`)
+- [x] User commands for session lifecycle (`!clear`, `!reset`, `!end`, `!new`)
 - [ ] Attach the Slack MCP server inside the session so Claude can post
       progress reactions and intermediate messages mid-tool-use
 - [ ] Per-channel model override (heavyweight Opus on `#kt-claude-chat`,
       Haiku on a high-frequency channel)
-- [ ] `interrupt` command — type `^stop` in a thread to abort a long task
+- [ ] `!stop` command — interrupt a running long task without clearing the session
 - [ ] Tool-call structured logging (timestamps, tool name, brief args/results)
       for `tail -f` debugging
+- [ ] Real `AskUserQuestion` proxying (currently disabled with plain-text fallback)
