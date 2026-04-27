@@ -17,6 +17,7 @@ const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MIN ?? 30) * 60 * 1000;
 
 const RESET_RE = /^\s*!(clear|reset|end|new)\b/i;
 const STOP_RE = /^\s*!stop\b/i;
+const LOG_LEVEL = (process.env.BRIDGE_LOG_LEVEL ?? "info").toLowerCase() as "info" | "debug";
 
 const app = new App({
   token: SLACK_BOT_TOKEN,
@@ -258,8 +259,10 @@ function createSession(args: {
   ref.lastActivity = Date.now();
   store.upsert(ref);
 
-  console.log(
-    `[bridge] session ${resumeFrom ? "resumed" : "start"} thread=${threadTs} cwd=${route.cwd}${resumeFrom ? ` from=${resumeFrom}` : ""}`,
+  blog(
+    threadTs,
+    "info",
+    `session ${resumeFrom ? "resumed" : "start"} cwd=${route.cwd}${resumeFrom ? ` from=${resumeFrom}` : ""}`,
   );
   return session;
 }
@@ -284,27 +287,49 @@ async function pumpOutputs(
             ref.sessionId = sid;
             ref.lastActivity = Date.now();
             store.upsert(ref);
-            console.log(`[bridge] session_id captured thread=${threadTs} sid=${sid}`);
+            blog(threadTs, "info", `session_id sid=${sid}`);
           }
         }
       }
 
       if (msg.type === "assistant") {
-        const text = (msg.message.content as Array<{ type: string; text?: string }>)
-          .filter((b) => b.type === "text" && typeof b.text === "string")
-          .map((b) => b.text!)
-          .join("");
-        if (text.trim()) {
+        const blocks = msg.message.content as Array<{
+          type: string;
+          text?: string;
+          name?: string;
+          input?: unknown;
+        }>;
+        let textBuf = "";
+        for (const block of blocks) {
+          if (block.type === "text" && typeof block.text === "string") {
+            textBuf += block.text;
+          } else if (block.type === "tool_use" && block.name) {
+            blog(threadTs, "info", `tool ${block.name}(${briefArgs(block.input)})`);
+          }
+        }
+        if (textBuf.trim()) {
           await client.chat.postMessage({
             channel,
             thread_ts: threadTs,
-            text: truncate(text, 39000),
+            text: truncate(textBuf, 39000),
           });
+        }
+      } else if (msg.type === "user") {
+        const tur = (msg as { tool_use_result?: unknown }).tool_use_result;
+        if (tur !== undefined) {
+          const size = typeof tur === "string" ? tur.length : JSON.stringify(tur).length;
+          blog(threadTs, "info", `result ${size}c`);
+          if (LOG_LEVEL === "debug") {
+            const preview = (typeof tur === "string" ? tur : JSON.stringify(tur)).slice(0, 240);
+            blog(threadTs, "debug", `result.preview ${preview.replace(/\n/g, "↵")}`);
+          }
         }
       } else if (msg.type === "result") {
         const r = msg as { total_cost_usd?: number; num_turns?: number; duration_ms?: number };
-        console.log(
-          `[bridge] turn done thread=${threadTs} cost=$${r.total_cost_usd?.toFixed(4) ?? "?"} turns=${r.num_turns ?? "?"} dur=${r.duration_ms ?? "?"}ms`,
+        blog(
+          threadTs,
+          "info",
+          `turn done cost=$${r.total_cost_usd?.toFixed(4) ?? "?"} turns=${r.num_turns ?? "?"} dur=${r.duration_ms ?? "?"}ms`,
         );
       }
     }
@@ -331,7 +356,7 @@ async function pumpOutputs(
       ref.status = "idle";
       store.upsert(ref);
     }
-    console.log(`[bridge] session unloaded thread=${threadTs}`);
+    blog(threadTs, "info", "session unloaded");
   }
 }
 
@@ -365,6 +390,35 @@ function buildSystemPrompt(route: Route, channel: string, threadTs: string): str
 
 function stripMentions(text: string): string {
   return text.replace(/<@[A-Z0-9]+>\s*/g, "").trim();
+}
+
+function fmtTs(): string {
+  return new Date().toISOString().slice(11, 19);
+}
+
+function blog(threadTs: string, level: "info" | "debug", msg: string): void {
+  if (level === "debug" && LOG_LEVEL !== "debug") return;
+  const tag = level === "debug" ? "[debug]" : "[bridge]";
+  console.log(`${fmtTs()} ${tag} thread=${threadTs} ${msg}`);
+}
+
+function briefArgs(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const i = input as Record<string, unknown>;
+  if (typeof i.file_path === "string") return `path=${shortPath(i.file_path)}`;
+  if (typeof i.path === "string") return `path=${shortPath(i.path)}`;
+  if (typeof i.command === "string") return `cmd=${truncate(i.command, 80)}`;
+  if (typeof i.pattern === "string") return `pattern=${truncate(i.pattern, 60)}`;
+  if (typeof i.prompt === "string") return `prompt="${truncate(i.prompt, 60)}"`;
+  if (typeof i.url === "string") return `url=${truncate(i.url, 80)}`;
+  if (typeof i.query === "string") return `query="${truncate(i.query, 60)}"`;
+  if (typeof i.subagent_type === "string") return `agent=${i.subagent_type}`;
+  if (typeof i.skill === "string") return `skill=${i.skill}`;
+  return Object.keys(i).slice(0, 3).join(",");
+}
+
+function shortPath(p: string): string {
+  return p.length > 60 ? "…" + p.slice(-57) : p;
 }
 
 function truncate(text: string, max: number): string {
@@ -428,7 +482,7 @@ async function main(): Promise<void> {
 
   await app.start();
   console.log(
-    `[bridge] running. model=${MODEL}, bot=${BOT_USER_ID}, idle_timeout=${IDLE_TIMEOUT_MS / 60000}min, channels=[${Object.keys(ROUTES).join(", ")}], persisted_threads=${store.size()}`,
+    `[bridge] running. model=${MODEL}, bot=${BOT_USER_ID}, idle_timeout=${IDLE_TIMEOUT_MS / 60000}min, log_level=${LOG_LEVEL}, channels=[${Object.keys(ROUTES).join(", ")}], persisted_threads=${store.size()}`,
   );
 
   // Idle sweep every minute
